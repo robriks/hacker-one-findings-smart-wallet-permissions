@@ -13,6 +13,8 @@ import {CallErrors} from "./utils/CallErrors.sol";
 import {SignatureCheckerLib} from "./utils/SignatureCheckerLib.sol";
 import {UserOperation, UserOperationLib} from "./utils/UserOperationLib.sol";
 
+import {Test, console2} from "forge-std/Test.sol";
+
 /// @title PermissionManager
 ///
 /// @notice A dynamic permission system built into an EIP-1271 module designed for Coinbase Smart Wallet
@@ -356,7 +358,7 @@ contract PermissionManager is IERC1271, Ownable2Step, Pausable {
             revert CallErrors.SelectorNotAllowed(bytes4(data.userOp.callData));
         }
 
-        CoinbaseSmartWallet.Call[] memory calls =
+        CoinbaseSmartWallet.Call[] memory calls = 
             abi.decode(BytesLib.trimSelector(data.userOp.callData), (CoinbaseSmartWallet.Call[]));
 
         // prepare beforeCalls data
@@ -365,6 +367,8 @@ contract PermissionManager is IERC1271, Ownable2Step, Pausable {
 
         // check first call is valid self.beforeCalls
         if (calls[0].target != address(this) || !BytesLib.eq(calls[0].data, beforeCallsData)) {
+            // console2.logAddress(calls[0].target);
+            // console2.logBytes(calls[0].data);
             revert InvalidBeforeCallsCall();
         }
 

