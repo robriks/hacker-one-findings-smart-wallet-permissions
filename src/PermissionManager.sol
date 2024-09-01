@@ -91,7 +91,7 @@ contract PermissionManager is IERC1271, Ownable2Step, Pausable {
     ///
     /// @param sender Account that the user operation is made from.
     error InvalidUserOperationSender(address sender);
-
+    error InvalidPermissionApproval();
     /// @notice Permission is unauthorized by either revocation or lack of approval.
     error UnauthorizedPermission();
 
@@ -373,7 +373,7 @@ contract PermissionManager is IERC1271, Ownable2Step, Pausable {
         for (uint256 i = 1; i < callsLen; i++) {
             // prevent account and PermissionManager direct re-entrancy
             if (calls[i].target == data.permission.account || calls[i].target == address(this)) {
-                revert CallErrors.TargetNotAllowed(calls[i].target);
+                revert CallErrors.TargetNotAllowed(calls[i].target); // CAN ANOTHER executeBatch BE NESTED AND BYPASS THIS CHECK?
             }
         }
 
