@@ -367,8 +367,6 @@ contract PermissionManager is IERC1271, Ownable2Step, Pausable {
 
         // check first call is valid self.beforeCalls
         if (calls[0].target != address(this) || !BytesLib.eq(calls[0].data, beforeCallsData)) {
-            // console2.logAddress(calls[0].target);
-            // console2.logBytes(calls[0].data);
             revert InvalidBeforeCallsCall();
         }
 

