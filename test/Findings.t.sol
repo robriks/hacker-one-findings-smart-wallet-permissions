@@ -370,7 +370,7 @@ contract Findings is Test, EntrypointRuntimeBytecode {
         vm.etch(entrypoint, ENTRYPOINT_RUNTIME_BYTECODE);
     }
 
-        function test_permissionStructs() public {
+    function test_permissionStructs() public {
         _etchEntrypoint();
         _initializePermissionManager();
 
